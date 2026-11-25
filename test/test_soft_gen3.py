@@ -611,7 +611,7 @@ class TestSoftGen3Link(unittest.TestCase):
         ndw = 2*nlanes
         class Side(Module):
             def __init__(self, name):
-                self.submodules.dll = DataLinkLayer(125e6, ndw=ndw, nlanes=nlanes, framing="gen3", rx_depth=2048, tx_depth=2048)
+                self.submodules.dll = DataLinkLayer(125e6, ndw=ndw, nlanes=nlanes, framing="gen3", rx_depth=2048, tx_depth=2048, with_rx_merge=True)
                 self.submodules.ltx = Gen3LinkTX(nlanes, skp_interval=40)
                 self.submodules.lrx = Gen3LinkRX(nlanes)
                 self.lanes_tx = [Gen3LaneTX(LFSR_SEEDS[i]) for i in range(nlanes)]

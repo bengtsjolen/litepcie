@@ -352,7 +352,7 @@ class SoftPHYEndpointSim(SoCMini):
         self.root_phy = root_phy = root_phy_cls(serdes_root, sys_clk_freq, upstream=False,
             timer_scale=timer_scale, ts1_min=ts1_min)
         root_dll_kwargs = dict(ndw=nlanes, nlanes=nlanes, rx_depth=2048*nlanes, tx_depth=1024*nlanes) if nlanes > 1 else {}
-        self.root_dll = root_dll = ClockDomainsRenamer("pcie_link")(DataLinkLayer(sys_clk_freq, **root_dll_kwargs))
+        self.root_dll = root_dll = ClockDomainsRenamer("pcie_link")(DataLinkLayer(sys_clk_freq, with_rx_merge=True, **root_dll_kwargs))
         self.comb += [
             root_phy.link_number.eq(0x00),
             root_dll.link_up.eq(root_phy.ltssm.link_up),

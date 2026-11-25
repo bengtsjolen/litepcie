@@ -18,6 +18,12 @@ from litex.gen import *
 
 FC_P, FC_NP, FC_CPL = 0, 1, 2
 
+# Accept-order tag width: each TLP committed to a per-type receive buffer carries a monotonic accept
+# index (wire order), used to merge the per-type sources back into one stream (RXAcceptMerge). 16 bits
+# is far above the number of TLPs any receive buffer holds at once, so the index is unique while a TLP
+# is buffered and the equality comparison in the merge is unambiguous.
+RX_TAG_WIDTH = 16
+
 def tlp_credits(dw0):
     """(statements, fc_type, data_credits) from the TLP header DW0 (byte 0 on bits 7:0): Fmt
     (byte 0 [7:5]), Type (byte 0 [4:0]), Length (byte 2 [1:0], byte 3). Completions: Type 0101x.
@@ -112,9 +118,11 @@ class FlowControlRX(LiteXModule):
     when the allocated credits of a type change (UpdateFC to send), cleared by sent."""
     def __init__(self, p_hdr, p_data, np_hdr, np_data, cpl_hdr=0, cpl_data=0):
         self.reset        = Signal()  # i
-        self.deliver      = Signal()  # i (Pulse): TLP delivered to the Transaction Layer.
-        self.deliver_type = Signal(2) # i
-        self.deliver_data = Signal(9) # i
+        # Per-type delivery pulses (P, NP, Cpl): with separate receive queues, two types can be
+        # delivered to the Transaction Layer in the same cycle, so each type has its own pulse and
+        # data-credit input rather than a single shared pulse/type.
+        self.deliver      = Signal(3)                               # i (Pulse per type).
+        self.deliver_data = Array(Signal(9) for _ in range(3))      # i: data credits, per type.
         self.sent         = Signal()  # i (Pulse): UpdateFC sent for sent_type.
         self.sent_type    = Signal(2) # i
         self.changed      = Signal(3) # o
@@ -134,9 +142,9 @@ class FlowControlRX(LiteXModule):
                     allocated_data[t].eq(self.initial_data[t]),
                     self.changed[t].eq(0),
                 ).Else(
-                    If(self.deliver & (self.deliver_type == t),
+                    If(self.deliver[t],
                         allocated_hdr[t].eq(allocated_hdr[t] + 1),
-                        allocated_data[t].eq(allocated_data[t] + self.deliver_data),
+                        allocated_data[t].eq(allocated_data[t] + self.deliver_data[t]),
                         self.changed[t].eq(not self.infinite[t]),
                     ).Elif(self.sent & (self.sent_type == t),
                         self.changed[t].eq(0)

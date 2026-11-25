@@ -139,8 +139,8 @@ class WideDLLSim(SoCMini):
         self.sync += timer.eq(timer + 1)
 
         kwargs = dict(ndw=ndw, nlanes=nlanes, tx_depth=4096, rx_depth=4096)
-        self.dll_a = a = DataLinkLayer(sys_clk_freq, **kwargs)
-        self.dll_b = b = DataLinkLayer(sys_clk_freq, **kwargs)
+        self.dll_a = a = DataLinkLayer(sys_clk_freq, with_rx_merge=True, **kwargs)
+        self.dll_b = b = DataLinkLayer(sys_clk_freq, with_rx_merge=True, **kwargs)
         self.comb += [
             a.link_up.eq(1), a.l0.eq(1), b.link_up.eq(1), b.l0.eq(1),
             a.phy_sink.ready.eq(1), b.phy_sink.ready.eq(1),
@@ -261,8 +261,8 @@ class MultiLanePHYSim(SoCMini):
 
         # Data Link Layers.
         dll_kwargs = dict(ndw=ndw, nlanes=nlanes, tx_depth=4096, rx_depth=4096, framing="both" if gen3 else "8b10b")
-        self.dll_up = dll_up = DataLinkLayer(sys_clk_freq, **dll_kwargs)
-        self.dll_dn = dll_dn = DataLinkLayer(sys_clk_freq, **dll_kwargs)
+        self.dll_up = dll_up = DataLinkLayer(sys_clk_freq, with_rx_merge=True, **dll_kwargs)
+        self.dll_dn = dll_dn = DataLinkLayer(sys_clk_freq, with_rx_merge=True, **dll_kwargs)
         for dll, phy in [(dll_up, phy_up), (dll_dn, phy_dn)]:
             self.comb += [
                 dll.link_up.eq(phy.ltssm.link_up),

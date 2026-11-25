@@ -22,10 +22,63 @@ from litex.soc.interconnect import stream
 from litepcie.phy.soft.common           import lane_layout
 from litepcie.phy.soft.dll.dllp         import DLLPEncoder, DLLPDecoder
 from litepcie.phy.soft.dll.dllp         import DLLP_ACK, DLLP_NAK, DLLP_INITFC1_P, DLLP_INITFC2_P, DLLP_UPDATEFC_P
-from litepcie.phy.soft.dll.flow_control import FlowControlTX, FlowControlRX
+from litepcie.phy.soft.dll.flow_control import FlowControlTX, FlowControlRX, RX_TAG_WIDTH
 from litepcie.phy.soft.dll.rx           import DLLRX
 from litepcie.phy.soft.dll.tx           import DLLTX
 from litepcie.phy.soft.dll.wide         import WideDLLRX, WideDLLTX
+
+# Credit-derived receive buffer sizing -------------------------------------------------------------
+
+def _next_pow2(n):
+    return 1 << max(n - 1, 0).bit_length()
+
+def rx_buffer_size(hdr, data, ndw=1):
+    """PacketBuffer (depth: DWs of storage, packets: descriptors) that holds the advertised credits of
+    a type: hdr header credits (up to 4 header DWs each) and data credits (16 bytes = 4 DWs each). The
+    buffer has to hold the whole initial advertisement, since the credits only come back once a TLP
+    has left. It stores beats of ndw DWs and a TLP starts on a new beat, so each outstanding TLP (one
+    per header credit) can also cost a partial last beat: up to ndw - 1 DWs of storage that hold no
+    content (none at ndw = 1). hdr/data must not both be 0 (that is the infinite/Completion encoding,
+    which is not buffer-sized)."""
+    assert not (hdr == 0 and data == 0), "a finite credit advertisement is required (0/0 is infinite)"
+    dws     = 4*hdr + 4*data + hdr*(ndw - 1)
+    depth   = _next_pow2(max(dws, ndw))
+    packets = _next_pow2(hdr)
+    return depth, packets
+
+# RX accept-order merge ----------------------------------------------------------------------------
+
+class RXAcceptMerge(LiteXModule):
+    """Merge the per-credit-type receive sources (source_p/np/cpl) into one stream in accept (wire)
+    order, from the monotonic accept tag each TLP carries. A newer tag is held until the next index
+    is at the head of its queue. This is a helper for the benches and the unit tests, which compare
+    received TLPs in wire order; the PHY does not use it (the Transaction Layer drains the three
+    sources independently, which is the whole point of the split)."""
+    def __init__(self, sources, ndw=1):
+        layout = [("data", 32*ndw)] + ([("dws", bits_for(ndw))] if ndw > 1 else [])
+        self.source = source = stream.Endpoint(layout)
+
+        # # #
+
+        next_tag = Signal(RX_TAG_WIDTH)
+        busy     = Signal()
+        grant    = Signal(max=max(len(sources), 2))
+        sel      = Signal(max=max(len(sources), 2))
+        match    = [src.valid & (src.tag == next_tag) for src in sources]
+        # Hold the grant while a packet is forwarded, otherwise pick the source whose head tag is the
+        # next index (at most one source matches, the tags being unique while buffered).
+        select = None
+        for i in reversed(range(len(sources))):
+            select = If(match[i], sel.eq(i)) if select is None else If(match[i], sel.eq(i)).Else(select)
+        self.comb += If(busy, sel.eq(grant)).Else(select)
+        self.comb += If(busy | Reduce("OR", match),
+            Case(sel, {i: sources[i].connect(source, omit={"fc_data", "tag"}) for i in range(len(sources))})
+        )
+        self.sync += If(source.valid & source.ready,
+            grant.eq(sel),
+            busy.eq(~source.last),
+            If(source.last, next_tag.eq(next_tag + 1)),
+        )
 
 # Data Link Layer ----------------------------------------------------------------------------------
 
@@ -38,7 +91,8 @@ class DataLinkLayer(LiteXModule):
     ndw: DWs per cycle on sink/source, with dws the valid DWs of a beat, and on the lane words (above 1:
     links wider than x1, nlanes: the link width)."""
     def __init__(self, clk_freq, p_hdr=16, p_data=128, np_hdr=8, np_data=8, rx_depth=2048, tx_depth=1024,
-        descriptors=16, replay_timer=None, update_timer=None, ndw=1, nlanes=1, framing="8b10b"):
+        descriptors=16, replay_timer=None, update_timer=None, ndw=1, nlanes=1, framing="8b10b",
+        with_rx_merge=False):
         self.link_up    = Signal()   # i
         self.l0         = Signal()   # i: LTSSM in L0 (lane traffic).
         self.dl_active  = Signal()   # o
@@ -47,7 +101,15 @@ class DataLinkLayer(LiteXModule):
         self.gen3       = Signal()   # i: 8.0 GT/s framing (framing="both": 8b/10b or 8.0 GT/s from the rate).
         tlp_layout      = [("data", 32*ndw)] + ([("dws", bits_for(ndw))] if ndw > 1 else [])
         self.sink       = sink   = stream.Endpoint(tlp_layout)
-        self.source     = source = stream.Endpoint(tlp_layout)
+        # Received TLPs. with_rx_merge=False (the PHY): one source per flow-control type (P/NP/Cpl),
+        # drained independently by the Transaction Layer so a stalled Completion cannot block a Config
+        # request. with_rx_merge=True (benches/tests): a single source in wire order (RXAcceptMerge).
+        if with_rx_merge:
+            self.source = None # Assigned to the merge below.
+        else:
+            self.source_p   = stream.Endpoint(tlp_layout)
+            self.source_np  = stream.Endpoint(tlp_layout)
+            self.source_cpl = stream.Endpoint(tlp_layout)
         self.phy_sink   = stream.Endpoint(lane_layout(4*ndw)) # o: to the Physical Layer.
         self.phy_source = stream.Endpoint(lane_layout(4*ndw)) # i: from the Physical Layer.
 
@@ -62,18 +124,26 @@ class DataLinkLayer(LiteXModule):
         self.comb += reset.eq(~self.link_up)
 
         # RX/TX ------------------------------------------------------------------------------------
-        # Completions have infinite credits: the receive buffer holds all the Completions of the
-        # requests in flight, as many packets as 64-byte (16-DW) Completions fit in its depth. The
-        # framers' FIFO absorbs the bursts of short TLPs (a 64-byte Completion is 1.3 beats on the
-        # lanes and 2 beats aligned, under a beat of FIFO each): a quarter of the packets.
-        rx_packets = max(64, rx_depth//16)
+        # The Completion buffer has infinite credits: it holds all the Completions of the requests in
+        # flight, as many packets as 64-byte (16-DW) Completions fit in its depth (rx_depth), and an
+        # overflow drops the TLP, Acks it and counts the drop (rx.cpl_drops). The framers' FIFO absorbs
+        # the bursts of short TLPs (a 64-byte Completion is 1.3 beats on the lanes and 2 beats aligned,
+        # under a beat of FIFO each): a quarter of the packets. The Posted and Non-Posted buffers are
+        # sized to the credits advertised for them (p_hdr/p_data, np_hdr/np_data), partial last beats
+        # included, so the link partner is never told it may send more than fits (that would be Nak'd,
+        # replaying a full buffer).
+        rx_packets          = max(64, rx_depth//16)
+        p_depth, p_packets  = rx_buffer_size(p_hdr,  p_data,  ndw)
+        np_depth, np_packets = rx_buffer_size(np_hdr, np_data, ndw)
+        rx_buffer_kwargs = dict(depth=rx_depth, packets=rx_packets,
+            p_depth=p_depth, p_packets=p_packets, np_depth=np_depth, np_packets=np_packets)
         if ndw > 1:
-            self.rx = rx = WideDLLRX(ndw, depth=rx_depth, packets=rx_packets, framing=framing, nlanes=nlanes,
-                fifo_depth=max(64, rx_packets//4))
+            self.rx = rx = WideDLLRX(ndw, framing=framing, nlanes=nlanes,
+                fifo_depth=max(64, rx_packets//4), **rx_buffer_kwargs)
             self.tx = tx = WideDLLTX(ndw, nlanes, depth=tx_depth, descriptors=descriptors, replay_timer=replay_timer, framing=framing)
             self.comb += [rx.gen3.eq(self.gen3), tx.gen3.eq(self.gen3)]
         else:
-            self.rx = rx = DLLRX(depth=rx_depth, packets=rx_packets)
+            self.rx = rx = DLLRX(**rx_buffer_kwargs)
             self.tx = tx = DLLTX(depth=tx_depth, descriptors=descriptors, replay_timer=replay_timer)
         self.comb += [
             rx.reset.eq(reset),
@@ -81,10 +151,18 @@ class DataLinkLayer(LiteXModule):
             tx.replay.hold.eq(~self.l0),
             self.phy_source.connect(rx.sink),
             tx.source.connect(self.phy_sink),
-            rx.source.connect(source),
             sink.connect(tx.sink),
             self.link_error.eq(tx.replay.link_error),
         ]
+        if with_rx_merge:
+            self.rx_merge = rx_merge = RXAcceptMerge([rx.source_p, rx.source_np, rx.source_cpl], ndw=ndw)
+            self.source = rx_merge.source
+        else:
+            self.comb += [
+                rx.source_p.connect(self.source_p,     omit={"fc_data", "tag"}),
+                rx.source_np.connect(self.source_np,   omit={"fc_data", "tag"}),
+                rx.source_cpl.connect(self.source_cpl, omit={"fc_data", "tag"}),
+            ]
 
         # Flow Control -----------------------------------------------------------------------------
         self.fc_tx = fc_tx = FlowControlTX()
@@ -96,9 +174,13 @@ class DataLinkLayer(LiteXModule):
             fc_tx.tlp_data.eq(tx.replay.fc_data),
             tx.replay.fc_ok.eq(fc_tx.ok),
             fc_tx.consume.eq(tx.replay.fc_consume),
-            fc_rx.deliver.eq(rx.deliver),
-            fc_rx.deliver_type.eq(rx.deliver_type),
-            fc_rx.deliver_data.eq(rx.deliver_data),
+        ]
+        # Per-type delivery (Completions infinite: not tracked), narrow or wide.
+        self.comb += [
+            fc_rx.deliver[0].eq(rx.deliver_p),
+            fc_rx.deliver[1].eq(rx.deliver_np),
+            fc_rx.deliver_data[0].eq(rx.deliver_p_data),
+            fc_rx.deliver_data[1].eq(rx.deliver_np_data),
         ]
 
         # Received DLLPs ---------------------------------------------------------------------------

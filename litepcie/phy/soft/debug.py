@@ -11,6 +11,9 @@ The LTSSM runs in "pcie_link" and the lane in "pcie_pipe": levels are resynchron
 MultiReg (multi-bit counters sampled as they change: debug precision), pulses with PulseSynchronizer.
 """
 
+from functools import reduce
+from operator import or_
+
 from migen import *
 from migen.genlib.cdc import MultiReg, PulseSynchronizer
 
@@ -340,26 +343,39 @@ class SoftPHYDebug(LiteXModule, AutoCSR):
             ])
             self._dll_replays     = CSRStatus(16, description="TLP replays.")
             self._dll_rx_errors   = CSRStatus(16, description="LCRC, sequence and framing errors.")
+            self._dll_cpl_drops   = CSRStatus(16, description="Completions Ack'd but dropped (receive buffer full): silent DMA data loss.")
             self._dll_link_errors = CSRStatus(16, description="REPLAY_NUM rollovers (Recovery requested).")
             self._dll_tx_tlps     = CSRStatus(32, description="TLPs accepted from the Transaction Layer.")
             self._dll_rx_tlps     = CSRStatus(32, description="TLPs delivered to the Transaction Layer.")
             link_errors = Signal(16)
             tx_tlps     = Signal(32)
             rx_tlps     = Signal(32)
+            # The DLL exposes one received-TLP source per flow-control type (P/NP/Cpl); aggregate them
+            # for the debug counters/status.
+            rx_sources = [dll.source_p, dll.source_np, dll.source_cpl]
+            rx_valid   = Signal()
+            rx_ready   = Signal()
+            rx_deliver = Signal()
+            self.comb += [
+                rx_valid.eq(reduce(or_, [s.valid for s in rx_sources])),
+                rx_ready.eq(reduce(or_, [s.valid & s.ready for s in rx_sources])),
+                rx_deliver.eq(reduce(or_, [s.valid & s.ready & s.last for s in rx_sources])),
+            ]
             self.sync.pcie_link += [
                 If(dll.link_error, link_errors.eq(link_errors + 1)),
                 If(dll.sink.valid & dll.sink.ready & dll.sink.last, tx_tlps.eq(tx_tlps + 1)),
-                If(dll.source.valid & dll.source.ready & dll.source.last, rx_tlps.eq(rx_tlps + 1)),
+                If(rx_deliver, rx_tlps.eq(rx_tlps + 1)),
             ]
             for src, dst in [
                 (dll.state,             self._dll_status.fields.state),
                 (dll.tx.replay.pending, self._dll_status.fields.pending),
                 (dll.tx.replay.fc_ok,   self._dll_status.fields.fc_ok),
                 (dll.sink.ready,        self._dll_status.fields.tx_ready),
-                (dll.source.valid,      self._dll_status.fields.rx_valid),
-                (dll.source.ready,      self._dll_status.fields.rx_ready),
+                (rx_valid,              self._dll_status.fields.rx_valid),
+                (rx_ready,              self._dll_status.fields.rx_ready),
                 (dll.tx.replay.replays, self._dll_replays.status),
                 (dll.rx.errors,         self._dll_rx_errors.status),
+                (dll.rx.cpl_drops,      self._dll_cpl_drops.status),
                 (link_errors,           self._dll_link_errors.status),
                 (tx_tlps,               self._dll_tx_tlps.status),
                 (rx_tlps,               self._dll_rx_tlps.status),

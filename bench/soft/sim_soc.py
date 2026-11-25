@@ -339,7 +339,7 @@ class SoftPHYSoCSim(SoCMini):
             timer_scale=timer_scale, ts1_min=ts1_min, **root_kw)
         dll_kw = dict(ndw=ndw, nlanes=nlanes, rx_depth=2048*ndw, tx_depth=1024*ndw,
             framing="both" if gen3 else "8b10b") if wide else {}
-        self.root_dll = root_dll = ClockDomainsRenamer("pcie_link")(DataLinkLayer(link_freq, **dll_kw))
+        self.root_dll = root_dll = ClockDomainsRenamer("pcie_link")(DataLinkLayer(link_freq, with_rx_merge=True, **dll_kw))
         if gen3:
             # Speed change directed by the root on its first L0, lanes clock at sys from 5.0 GT/s.
             l0_seen = Signal()

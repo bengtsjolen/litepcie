@@ -57,7 +57,11 @@ class TLPArbiter(LiteXModule):
 
 class SoftTransactionLayer(LiteXModule):
     def __init__(self, bar0_mask, nlanes=1, vendor_id=0x10ee, device_id=0x7021, msi_vectors=1, gen2_capable=False, gen3_capable=False):
-        self.sink       = sink       = stream.Endpoint([("data", 32)]) # i: from the Data Link Layer.
+        # One received-TLP sink per flow-control type (the Data Link Layer keeps a buffer per type),
+        # so a Completion the application does not accept cannot block a Config read behind it.
+        self.sink_p     = sink_p     = stream.Endpoint([("data", 32)]) # i: Posted (writes, messages).
+        self.sink_np    = sink_np    = stream.Endpoint([("data", 32)]) # i: Non-Posted (reads, Config).
+        self.sink_cpl   = sink_cpl   = stream.Endpoint([("data", 32)]) # i: Completions.
         self.source     = source     = stream.Endpoint([("data", 32)]) # o: to the Data Link Layer.
         self.ep_source  = ep_source  = stream.Endpoint([("data", 32)]) # o: to LitePCIe.
         self.ep_sink    = ep_sink    = stream.Endpoint([("data", 32)]) # i: from LitePCIe.
@@ -79,10 +83,13 @@ class SoftTransactionLayer(LiteXModule):
         self.comb += cfg.link_width.eq(self.link_width)
 
         # Received TLPs ----------------------------------------------------------------------------
-        fmt  = sink.data[5:8]
-        type = sink.data[0:5]
+        # Completions go straight to LitePCIe (via the RX arbiter below). Posted TLPs are filtered (only
+        # a 32-bit Memory Write is forwarded, see p_fsm). On the Non-Posted sink, Fmt[0]=0 & Type=0 is a
+        # 32-bit Memory Read (the Posted MWr32 arrives on sink_p); it is forwarded to the application,
+        # the rest (Config, other Non-Posted requests) is handled by the local FSM below.
+        fmt  = sink_np.data[5:8]
+        type = sink_np.data[0:5]
         is_mem32  = (fmt[0] == 0) & (type == 0)
-        is_cpl    = (fmt[0] == 0) & (type == 0b01010)
 
         dw0 = Signal(32)
         dw1 = Signal(32)
@@ -104,10 +111,12 @@ class SoftTransactionLayer(LiteXModule):
         r_cfg_adr  = Cat(dw2[26:32], dw2[16:20]) # Register Number, Extended Register Number.
         r_cfg_be   = dw1[24:28]                  # First DW BE.
 
+        # Non-Posted memory reads forwarded to the application (merged into ep_source by the RX arbiter).
+        np_fwd = stream.Endpoint([("data", 32)])
         self.rx_fsm = rx_fsm = FSM(reset_state="IDLE")
         rx_fsm.act("IDLE",
-            If(sink.valid,
-                If(is_mem32 | is_cpl,
+            If(sink_np.valid,
+                If(is_mem32,
                     NextState("TO-EP")
                 ).Else(
                     NextValue(rx_index, 0),
@@ -116,22 +125,22 @@ class SoftTransactionLayer(LiteXModule):
             )
         )
         rx_fsm.act("TO-EP",
-            sink.connect(ep_source),
-            If(sink.valid & sink.ready & sink.last,
+            sink_np.connect(np_fwd),
+            If(sink_np.valid & sink_np.ready & sink_np.last,
                 NextState("IDLE")
             )
         )
         rx_fsm.act("CAPTURE",
-            sink.ready.eq(1),
-            If(sink.valid,
+            sink_np.ready.eq(1),
+            If(sink_np.valid,
                 NextValue(rx_index, rx_index + 1),
                 Case(rx_index, {
-                    0: NextValue(dw0, sink.data),
-                    1: NextValue(dw1, sink.data),
-                    2: NextValue(dw2, sink.data),
-                    3: NextValue(dw3, sink.data),
+                    0: NextValue(dw0, sink_np.data),
+                    1: NextValue(dw1, sink_np.data),
+                    2: NextValue(dw2, sink_np.data),
+                    3: NextValue(dw3, sink_np.data),
                 }),
-                If(sink.last,
+                If(sink_np.last,
                     NextState("DECODE")
                 )
             )
@@ -271,6 +280,36 @@ class SoftTransactionLayer(LiteXModule):
                 NextState("IDLE")
             )
         )
+
+        # Posted filter: only a 32-bit Memory Write (Fmt[0]=0 & Type=0) reaches the application. The
+        # other Posted TLPs (Messages, MsgD, MWr64) are Posted requests, with no completion: they are
+        # consumed locally. Forwarding them would leave an unconsumed TLP on ep_source, stalling the
+        # memory writes behind it (a root complex sends Set_Slot_Power_Limit and error Messages).
+        p_fmt      = sink_p.data[5:8]
+        p_type     = sink_p.data[0:5]
+        p_is_mwr32 = (p_fmt[0] == 0) & (p_type == 0)
+        p_fwd      = stream.Endpoint([("data", 32)]) # Forwarded 32-bit Memory Writes.
+        self.p_fsm = p_fsm = FSM(reset_state="IDLE")
+        p_fsm.act("IDLE",
+            If(sink_p.valid,
+                If(p_is_mwr32, NextState("FWD")).Else(NextState("DROP"))
+            )
+        )
+        p_fsm.act("FWD",
+            sink_p.connect(p_fwd),
+            If(sink_p.valid & sink_p.ready & sink_p.last, NextState("IDLE"))
+        )
+        p_fsm.act("DROP",
+            sink_p.ready.eq(1),
+            If(sink_p.valid & sink_p.last, NextState("IDLE"))
+        )
+
+        # To LitePCIe: Completions (highest priority: they free credits of the requests in flight),
+        # then forwarded Posted writes and Non-Posted memory reads. A Completion the application does
+        # not accept holds this stream, so the Posted writes and forwarded reads behind it wait; Config
+        # and Unsupported Request are answered off sink_np (ready held high) and never reach here, so a
+        # stalled application cannot block host configuration access.
+        self.ep_arbiter = TLPArbiter([sink_cpl, p_fwd, np_fwd], ep_source)
 
         # Transmitted TLPs -------------------------------------------------------------------------
         # MSI goes before LitePCIe: DMA keeps the stream busy and keeps running without the driver,

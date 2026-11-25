@@ -23,7 +23,7 @@ from litex.soc.interconnect import stream
 from litepcie.phy.soft.common import COM, STP, SDP, END, EDB, PAD, lane_layout
 from litepcie.phy.soft.dll.buffer       import PacketBuffer
 from litepcie.phy.soft.dll.crc          import crc_next, crc_xor, crc_rewind_equations, crc_value, LCRC_POLYNOM, LCRC_INIT
-from litepcie.phy.soft.dll.flow_control import tlp_credits
+from litepcie.phy.soft.dll.flow_control import tlp_credits, FC_P, FC_NP, FC_CPL, RX_TAG_WIDTH
 from litepcie.phy.soft.dll.retry        import ReplayBuffer
 
 # Layouts ------------------------------------------------------------------------------------------
@@ -908,21 +908,29 @@ class TXFramerSelect(LiteXModule):
 # Data Link Layer RX -------------------------------------------------------------------------------
 
 class WideDLLRX(LiteXModule):
-    """As DLLRX, on beats of ndw DWs. Same interface towards the Data Link Layer core."""
-    def __init__(self, ndw, depth=2048, packets=32, framing="8b10b", nlanes=None, fifo_depth=64):
+    """As DLLRX, on beats of ndw DWs. Same interface towards the Data Link Layer core: one
+    received-TLP source per flow-control type (P/NP/Cpl) so a Completion the Transaction Layer does
+    not accept cannot block a (Config) Non-Posted request behind it. Each source carries the accept
+    tag (wire order) for RXAcceptMerge."""
+    def __init__(self, ndw, depth=2048, packets=32, framing="8b10b", nlanes=None, fifo_depth=64,
+                 p_depth=1024, p_packets=16, np_depth=128, np_packets=16):
         self.reset        = Signal()
         self.gen3         = Signal() # i: 8.0 GT/s framing (framing="both").
         self.sink         = sink   = stream.Endpoint(lane_layout(4*ndw))
-        self.source       = source = stream.Endpoint([("data", 32*ndw), ("dws", bits_for(ndw))])
+        self.source_p     = None       # o: Posted TLPs (assigned to the PacketBuffer sources below).
+        self.source_np    = None       # o: Non-Posted TLPs (Config, memory reads, UR requests).
+        self.source_cpl   = None       # o: Completions.
         self.dllp         = Signal(48)
         self.dllp_valid   = Signal()
         self.ack_req      = Signal()
         self.nak_req      = Signal()
         self.ack_seq      = Signal(12)
-        self.deliver      = Signal()
-        self.deliver_type = Signal(2)
-        self.deliver_data = Signal(9)
+        self.deliver_p       = Signal()   # o (Pulse): Posted TLP delivered.
+        self.deliver_np      = Signal()   # o (Pulse): Non-Posted TLP delivered.
+        self.deliver_p_data  = Signal(9)  # o
+        self.deliver_np_data = Signal(9)  # o
         self.errors       = Signal(16)
+        self.cpl_drops    = Signal(16) # o: Completions Ack'd but dropped (buffer full, see below).
 
         # # #
 
@@ -966,8 +974,14 @@ class WideDLLRX(LiteXModule):
         rx_lcrc = Signal(32)
         self.sync += If(end, Case(tlp.dws, {n: rx_lcrc.eq(tlp.data[32*(n - 1):32*n]) for n in range(1, ndw + 1)}))
 
-        # Store-and-forward buffer, beats delayed by one (the LCRC DW is not stored).
-        self.buffer = buffer = PacketBuffer([("fc_type", 2), ("fc_data", 9)], depth=depth, packets=packets, ndw=ndw)
+        # Store-and-forward buffers (one per flow-control type), beats delayed by one (the LCRC DW is
+        # not stored). The TLP's type (sampled on its first beat) selects its buffer. Each buffer also
+        # stores the accept tag (wire order) of its committed TLPs (see below).
+        param_layout = [("fc_data", 9), ("tag", RX_TAG_WIDTH)]
+        self.buf_p   = buf_p   = PacketBuffer(param_layout, depth=p_depth,  packets=p_packets,  ndw=ndw)
+        self.buf_np  = buf_np  = PacketBuffer(param_layout, depth=np_depth, packets=np_packets, ndw=ndw)
+        self.buf_cpl = buf_cpl = PacketBuffer(param_layout, depth=depth,    packets=packets,    ndw=ndw)
+        buffers = [buf_p, buf_np, buf_cpl]
         statements, dw0_type, dw0_data = tlp_credits(tlp.data)
         self.comb += statements
         fc_type    = Signal(2)
@@ -976,17 +990,24 @@ class WideDLLRX(LiteXModule):
         prev_data  = Signal(32*ndw)
         prev_dws   = Signal(bits_for(ndw))
         prev_first = Signal()
-        lost       = Signal()
-        lost_r     = Signal()
+        lost_pnp   = Signal() # Posted/Non-Posted beat not accepted by its buffer (will Nak).
+        lost_cpl   = Signal() # Completion beat not accepted (infinite credit: drop, do not Nak).
+        lost_pnp_r = Signal() # Posted/Non-Posted beats lost in the current TLP: Nak at its end.
+        lost_cpl_r = Signal() # Completion beats lost in the current TLP: drop at its end.
         end_r      = Signal()
         # The last beat holding only the LCRC: the previous beat stays the last one.
         only_lcrc  = tlp.last & (tlp.dws == 1)
         write_prev = tlp.valid & ~tlp.first & ~only_lcrc
         self.sync += [
             If(self.reset | end_r | framer.tlp_abort,
-                lost_r.eq(0)
-            ).Elif(lost,
-                lost_r.eq(1)
+                lost_pnp_r.eq(0)
+            ).Elif(lost_pnp,
+                lost_pnp_r.eq(1)
+            ),
+            If(self.reset | end_r | framer.tlp_abort,
+                lost_cpl_r.eq(0)
+            ).Elif(lost_cpl,
+                lost_cpl_r.eq(1)
             ),
             If(self.reset | framer.tlp_abort,
                 prev_valid.eq(0)
@@ -1034,22 +1055,48 @@ class WideDLLRX(LiteXModule):
         ]
         lcrc_ok = Mux(edb_r, lcrc.value == ~rx_lcrc, lcrc.value == rx_lcrc)
         bad     = Signal()
+        # One beat written, steered to the current TLP's buffer by its sampled type.
+        beat_valid = Signal()
+        sel_ready  = Signal()
         self.comb += [
-            buffer.sink.valid.eq((write_prev & prev_valid) | (end_r & prev_valid_r)),
-            buffer.sink.data.eq(prev_data),
-            buffer.sink.dws.eq(prev_dws),
-            buffer.sink.first.eq(prev_first),
-            buffer.sink.last.eq(end_r),
-            buffer.sink.fc_type.eq(fc_type),
-            buffer.sink.fc_data.eq(fc_data),
-            lost.eq(buffer.sink.valid & ~buffer.sink.ready),
-            accept.eq(end_r & prev_valid_r & lcrc_ok & ~edb_r & in_order_r & ~lost & ~lost_r),
-            bad.eq(end_r & (~prev_valid_r | ~lcrc_ok | lost | lost_r | (~edb_r & ~in_order_r & ~duplicate_r))),
-            buffer.abort.eq((end_r & ~accept) | framer.tlp_abort),
+            beat_valid.eq((write_prev & prev_valid) | (end_r & prev_valid_r)),
+            Case(fc_type, {t: sel_ready.eq(buffers[t].sink.ready) for t in range(3)}),
+        ]
+        # Accept tag (wire order): every TLP committed to a buffer is stamped with a monotonic index,
+        # incremented only on a commit. A dropped Completion is not committed and takes no tag.
+        tag = Signal(RX_TAG_WIDTH)
+        for t, buf in enumerate(buffers):
+            self.comb += [
+                buf.sink.valid.eq(beat_valid & (fc_type == t)),
+                buf.sink.data.eq(prev_data),
+                buf.sink.dws.eq(prev_dws),
+                buf.sink.first.eq(prev_first),
+                buf.sink.last.eq(end_r),
+                buf.sink.fc_data.eq(fc_data),
+                buf.sink.tag.eq(tag),
+            ]
+        committed = Signal()
+        self.comb += committed.eq(Reduce("OR",
+            [buf.sink.valid & buf.sink.ready & buf.sink.last & ~buf.abort for buf in buffers]))
+        self.comb += [
+            lost_pnp.eq(beat_valid & (fc_type != FC_CPL) & ~sel_ready),
+            lost_cpl.eq(beat_valid & (fc_type == FC_CPL) & ~sel_ready),
+            # A lost Completion is dropped, not Nak'd (Completion credit is infinite: a Nak would
+            # replay it forever). Lost Posted/Non-Posted is Nak'd (and should not happen: gated by the
+            # advertised credits, which match the buffer depth).
+            accept.eq(end_r & prev_valid_r & lcrc_ok & ~edb_r & in_order_r & ~lost_pnp & ~lost_pnp_r),
+            bad.eq(end_r & (~prev_valid_r | ~lcrc_ok | lost_pnp | lost_pnp_r | (~edb_r & ~in_order_r & ~duplicate_r))),
+            buf_p.abort.eq(  (fc_type == FC_P)   & (framer.tlp_abort | (end_r & ~accept))),
+            buf_np.abort.eq( (fc_type == FC_NP)  & (framer.tlp_abort | (end_r & ~accept))),
+            buf_cpl.abort.eq((fc_type == FC_CPL) & (framer.tlp_abort | (end_r & (~accept | lost_cpl | lost_cpl_r)))),
             self.ack_seq.eq(next_seq - 1),
             self.ack_req.eq(accept | (end_r & lcrc_ok & ~edb_r & duplicate_r)),
             self.nak_req.eq((bad | framer.tlp_abort | framer.error) & ~nak_scheduled),
         ]
+        # A Completion that passed its checks (Ack'd) but did not fit in its buffer is dropped (its
+        # credit is infinite, a Nak would replay it forever): silent DMA data loss, so it is counted.
+        cpl_drop = Signal()
+        self.comb += cpl_drop.eq(accept & (fc_type == FC_CPL) & (lost_cpl | lost_cpl_r))
         self.sync += [
             If(prev_first & (write_prev | end_r),
                 prev_first.eq(tlp.valid & tlp.first)
@@ -1058,6 +1105,7 @@ class WideDLLRX(LiteXModule):
                 next_seq.eq(0),
                 nak_scheduled.eq(0),
                 self.errors.eq(0),
+                self.cpl_drops.eq(0),
             ).Else(
                 If(accept,
                     next_seq.eq(next_seq + 1),
@@ -1067,15 +1115,23 @@ class WideDLLRX(LiteXModule):
                     nak_scheduled.eq(1),
                     self.errors.eq(self.errors + 1),
                 ),
+                If(cpl_drop, self.cpl_drops.eq(self.cpl_drops + 1)),
             )
         ]
+        # The accept tag is free-running (not reset with the link): it stays in step with the merge's
+        # next-tag counter, which also only advances on a delivery.
+        self.sync += If(committed, tag.eq(tag + 1))
 
-        # Transaction Layer delivery and credits.
+        # Transaction Layer delivery and credits. Each buffer's source is exposed independently; a
+        # delivery (last beat consumed) returns that type's credits (Completions are infinite).
+        self.source_p   = buf_p.source
+        self.source_np  = buf_np.source
+        self.source_cpl = buf_cpl.source
         self.comb += [
-            buffer.source.connect(source, omit={"fc_type", "fc_data"}),
-            self.deliver.eq(source.valid & source.ready & source.last),
-            self.deliver_type.eq(buffer.source.fc_type),
-            self.deliver_data.eq(buffer.source.fc_data),
+            self.deliver_p.eq(buf_p.source.valid & buf_p.source.ready & buf_p.source.last),
+            self.deliver_np.eq(buf_np.source.valid & buf_np.source.ready & buf_np.source.last),
+            self.deliver_p_data.eq(buf_p.source.fc_data),
+            self.deliver_np_data.eq(buf_np.source.fc_data),
         ]
 
 # Data Link Layer TX -------------------------------------------------------------------------------

@@ -11,6 +11,7 @@ from migen import *
 from litepcie.phy.soft.tl.adapter      import TXAdapter, RXAdapter
 from litepcie.phy.soft.tl.config_space import PCIeConfigSpace
 from litepcie.phy.soft.tl.core         import SoftTransactionLayer
+from litepcie.phy.soft.tl.wide         import WideTransactionLayer
 
 MSI_CTRL   = 0x48
 MSI_ADR_LO = 0x4c
@@ -168,22 +169,204 @@ class TestSoftTL(unittest.TestCase):
             self.assertEqual(lanes_eq, [0x7f7f7f7f]*4 + [0])
         run_simulation(dut, generator())
 
+    def test_config_not_blocked_by_stalled_completion(self):
+        # The whole point of the per-type receive queues: a Completion the application will not accept
+        # (ep_source stalled) must not block a Config read. The config completion still goes out on the
+        # transmit path, and the held Completion is delivered unchanged once the application is ready.
+        dut    = SoftTransactionLayer(bar0_mask=0xfff00000)
+        cpl_in = [0x0000000a, 0x11111111, 0x22222222]  # A 3-DW Completion waiting on sink_cpl.
+        cfg_rd = [0x01000004, 0x0f000000, 0x00000000]  # CfgRd0 to function 0 (3 DW, no data).
+        tx, ep = [], []
+        @passive
+        def drive_cpl():
+            i = 0
+            yield dut.sink_cpl.valid.eq(1)
+            while i < len(cpl_in):
+                yield dut.sink_cpl.data.eq(cpl_in[i])
+                yield dut.sink_cpl.first.eq(i == 0)
+                yield dut.sink_cpl.last.eq(i == len(cpl_in) - 1)
+                yield
+                if (yield dut.sink_cpl.valid) and (yield dut.sink_cpl.ready):
+                    i += 1
+            yield dut.sink_cpl.valid.eq(0)
+        @passive
+        def collect_tx():
+            yield dut.source.ready.eq(1)
+            while True:
+                if (yield dut.source.valid) and (yield dut.source.ready):
+                    tx.append((yield dut.source.data))
+                yield
+        @passive
+        def collect_ep():
+            while True:
+                if (yield dut.ep_source.valid) and (yield dut.ep_source.ready):
+                    ep.append((yield dut.ep_source.data))
+                yield
+        def generator():
+            yield dut.ep_source.ready.eq(0)  # Application cannot accept the Completion.
+            for _ in range(8):
+                yield
+            yield dut.sink_np.valid.eq(1)
+            for i, dw in enumerate(cfg_rd):
+                yield dut.sink_np.data.eq(dw)
+                yield dut.sink_np.first.eq(i == 0)
+                yield dut.sink_np.last.eq(i == len(cfg_rd) - 1)
+                yield
+                while not (yield dut.sink_np.ready):
+                    yield
+            yield dut.sink_np.valid.eq(0)
+            yield dut.sink_np.first.eq(0)
+            yield dut.sink_np.last.eq(0)
+            for _ in range(300):
+                if len(tx) >= 4:
+                    break
+                yield
+            self.assertGreaterEqual(len(tx), 4, "config completion did not appear while app stalled")
+            self.assertEqual(len(ep), 0, "the Completion was delivered though the app was stalled")
+            yield dut.ep_source.ready.eq(1)  # Release the application.
+            for _ in range(300):
+                if len(ep) >= len(cpl_in):
+                    break
+                yield
+            self.assertEqual(ep[:len(cpl_in)], cpl_in, "the held Completion was not delivered unchanged")
+        run_simulation(dut, [generator(), drive_cpl(), collect_tx(), collect_ep()])
+
+    def test_config_not_blocked_by_stalled_completion_wide(self):
+        # As above, on the wide Transaction Layer (ndw=2): beats carry dws.
+        ndw    = 2
+        dut    = WideTransactionLayer(ndw, bar0_mask=0xfff00000)
+        cpl_in = [0x0000000a, 0x11111111, 0x22222222]
+        cfg_rd = [0x01000004, 0x0f000000, 0x00000000]
+        def to_beats(dws):
+            beats = []
+            for i in range(0, len(dws), ndw):
+                chunk = dws[i:i + ndw]
+                beats.append((sum(d << (32*j) for j, d in enumerate(chunk)), len(chunk), i + ndw >= len(dws)))
+            return beats
+        tx, ep = [], []
+        def drain(data, n):
+            return [(data >> (32*j)) & 0xffffffff for j in range(n)]
+        @passive
+        def drive_cpl():
+            beats = to_beats(cpl_in)
+            i = 0
+            yield dut.sink_cpl.valid.eq(1)
+            while i < len(beats):
+                data, n, last = beats[i]
+                yield dut.sink_cpl.data.eq(data)
+                yield dut.sink_cpl.dws.eq(n)
+                yield dut.sink_cpl.first.eq(i == 0)
+                yield dut.sink_cpl.last.eq(last)
+                yield
+                if (yield dut.sink_cpl.valid) and (yield dut.sink_cpl.ready):
+                    i += 1
+            yield dut.sink_cpl.valid.eq(0)
+        @passive
+        def collect_tx():
+            yield dut.source.ready.eq(1)
+            while True:
+                if (yield dut.source.valid) and (yield dut.source.ready):
+                    tx.extend(drain((yield dut.source.data), (yield dut.source.dws)))
+                yield
+        @passive
+        def collect_ep():
+            while True:
+                if (yield dut.ep_source.valid) and (yield dut.ep_source.ready):
+                    ep.extend(drain((yield dut.ep_source.data), (yield dut.ep_source.dws)))
+                yield
+        def generator():
+            yield dut.ep_source.ready.eq(0)
+            for _ in range(8):
+                yield
+            for i, (data, n, last) in enumerate(to_beats(cfg_rd)):
+                yield dut.sink_np.valid.eq(1)
+                yield dut.sink_np.data.eq(data)
+                yield dut.sink_np.dws.eq(n)
+                yield dut.sink_np.first.eq(i == 0)
+                yield dut.sink_np.last.eq(last)
+                yield
+                while not (yield dut.sink_np.ready):
+                    yield
+            yield dut.sink_np.valid.eq(0)
+            yield dut.sink_np.first.eq(0)
+            yield dut.sink_np.last.eq(0)
+            for _ in range(400):
+                if len(tx) >= 4:
+                    break
+                yield
+            self.assertGreaterEqual(len(tx), 4, "config completion did not appear while app stalled")
+            self.assertEqual(len(ep), 0, "the Completion was delivered though the app was stalled")
+            yield dut.ep_source.ready.eq(1)
+            for _ in range(400):
+                if len(ep) >= len(cpl_in):
+                    break
+                yield
+            self.assertEqual(ep[:len(cpl_in)], cpl_in, "the held Completion was not delivered unchanged")
+        run_simulation(dut, [generator(), drive_cpl(), collect_tx(), collect_ep()])
+
+    def test_message_absorbed_mwr_forwarded(self):
+        # A Posted Message (byte 0 = 0x34) must be absorbed (no completion, nothing to the application),
+        # while a 32-bit Memory Write on the same Posted sink is still forwarded.
+        dut = SoftTransactionLayer(bar0_mask=0xfff00000)
+        msg = [0x00000034, 0x11111111, 0x22222222, 0x33333333] # Message, byte 0 = 0x34, 4 DW.
+        mwr = [0x01000040, 0x0f000001, 0x00001000, 0xdeadbeef] # MWr32 (Fmt 010 Type 0), 1 DW data.
+        ep, tx = [], []
+        @passive
+        def collect_ep():
+            yield dut.ep_source.ready.eq(1)
+            while True:
+                if (yield dut.ep_source.valid) and (yield dut.ep_source.ready):
+                    ep.append((yield dut.ep_source.data))
+                yield
+        @passive
+        def collect_tx():
+            yield dut.source.ready.eq(1)
+            while True:
+                if (yield dut.source.valid) and (yield dut.source.ready):
+                    tx.append((yield dut.source.data))
+                yield
+        def drive(words):
+            yield dut.sink_p.valid.eq(1)
+            for i, dw in enumerate(words):
+                yield dut.sink_p.data.eq(dw)
+                yield dut.sink_p.first.eq(i == 0)
+                yield dut.sink_p.last.eq(i == len(words) - 1)
+                yield
+                while not (yield dut.sink_p.ready):
+                    yield
+            yield dut.sink_p.valid.eq(0)
+            yield dut.sink_p.first.eq(0)
+            yield dut.sink_p.last.eq(0)
+        def generator():
+            yield from drive(msg)
+            for _ in range(32):
+                yield
+            self.assertEqual(ep, [], "the Message was forwarded to the application")
+            yield from drive(mwr)
+            for _ in range(64):
+                if len(ep) >= len(mwr):
+                    break
+                yield
+            self.assertEqual(ep, mwr, "the 32-bit Memory Write was not forwarded unchanged")
+            self.assertEqual(tx, [], "a Posted TLP must not produce a completion")
+        run_simulation(dut, [generator(), collect_ep(), collect_tx()])
+
     def test_msi_not_starved(self):
         # LitePCIe transmits back to back under DMA: an MSI waits for one TLP at most, and it can't be
         # left to the gaps since DMA keeps running without the driver when it misses its interrupts.
         dut = SoftTransactionLayer(bar0_mask=0xfff00000)
         tx  = []
         def cfg_write(reg, value):
-            # CfgWr0, 1 DW, First DW BE=0xf.
-            yield dut.sink.valid.eq(1)
+            # CfgWr0 is a Non-Posted request: driven on sink_np. 1 DW, First DW BE=0xf.
+            yield dut.sink_np.valid.eq(1)
             for i, dw in enumerate([0x01000044, 0x0f000000, reg << 26, value]):
-                yield dut.sink.data.eq(dw)
-                yield dut.sink.last.eq(i == 3)
+                yield dut.sink_np.data.eq(dw)
+                yield dut.sink_np.last.eq(i == 3)
                 yield
-                while not (yield dut.sink.ready):
+                while not (yield dut.sink_np.ready):
                     yield
-            yield dut.sink.valid.eq(0)
-            yield dut.sink.last.eq(0)
+            yield dut.sink_np.valid.eq(0)
+            yield dut.sink_np.last.eq(0)
         @passive
         def collect():
             yield dut.source.ready.eq(1)

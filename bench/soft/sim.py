@@ -336,8 +336,8 @@ class PCIeLinkSim(SoCMini):
         # Packets: upstream -> downstream and downstream -> upstream.
         self.with_dll = with_dll
         if with_dll:
-            self.dll_up = dll_up = DataLinkLayer(sys_clk_freq)
-            self.dll_dn = dll_dn = DataLinkLayer(sys_clk_freq)
+            self.dll_up = dll_up = DataLinkLayer(sys_clk_freq, with_rx_merge=True)
+            self.dll_dn = dll_dn = DataLinkLayer(sys_clk_freq, with_rx_merge=True)
             for dll, phy in [(dll_up, phy_up), (dll_dn, phy_dn)]:
                 self.comb += [
                     dll.link_up.eq(phy.ltssm.link_up),

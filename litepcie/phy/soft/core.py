@@ -163,19 +163,28 @@ class SoftPCIEPHY(LiteXModule, AutoCSR):
                     link_width_cases[w] = link_width.eq(log2_int(w))
             self.comb += Case(phy.width, link_width_cases)
             self.specials += MultiReg(link_width, self._link_status.fields.width, "sys")
+        # TLPs held in the Data Link Layer buffers while "pcie" is in reset. One received-TLP stream
+        # per flow-control type (P/NP/Cpl); the dws field carries the valid DWs of a beat (wide only).
+        for tl_sink, dll_source in [
+            (tl.sink_p,   dll.source_p),
+            (tl.sink_np,  dll.source_np),
+            (tl.sink_cpl, dll.source_cpl),
+        ]:
+            self.comb += [
+                tl_sink.valid.eq(dll_source.valid & ~pcie_rst),
+                tl_sink.first.eq(dll_source.first),
+                tl_sink.last.eq(dll_source.last),
+                tl_sink.data.eq(dll_source.data),
+                dll_source.ready.eq(tl_sink.ready & ~pcie_rst),
+                *([tl_sink.dws.eq(dll_source.dws)] if wide else []),
+            ]
         self.comb += [
-            # TLPs held in the Data Link Layer buffers while "pcie" is in reset.
-            tl.sink.valid.eq(dll.source.valid & ~pcie_rst),
-            tl.sink.first.eq(dll.source.first),
-            tl.sink.last.eq(dll.source.last),
-            tl.sink.data.eq(dll.source.data),
-            *([tl.sink.dws.eq(dll.source.dws), dll.sink.dws.eq(tl.source.dws)] if wide else []),
-            dll.source.ready.eq(tl.sink.ready & ~pcie_rst),
             dll.sink.valid.eq(tl.source.valid & ~pcie_rst),
             dll.sink.first.eq(tl.source.first),
             dll.sink.last.eq(tl.source.last),
             dll.sink.data.eq(tl.source.data),
             tl.source.ready.eq(dll.sink.ready & ~pcie_rst),
+            *([dll.sink.dws.eq(tl.source.dws)] if wide else []),
         ]
 
         # LitePCIe streams -------------------------------------------------------------------------
